@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "reviewer": { "mode": "manual", "provider": null, "model": null, "reasoning": "off", "timeoutMs": 30000, "maxTokens": 2048 },
+  "permissions": { "authorizerChain": ["ai-authorizer"], "yoloMode": false, "permission": { "*": "ask" } },
+  "limits": { "maxOpenPanes": 3, "maxDepth": 2, "maxLaunchesPerTurn": 8, "maxTurnsPerRun": 20, "maxTokensPerSession": null },
+  "panes": { "direction": "right", "shellReadyDelayMs": 500 },
+  "agents": {
+    "worker": {
+      "description": "Implement and verify a focused change",
+      "model": null,
+      "reasoning": "high",
+      "tools": ["read", "write", "edit", "bash", "grep", "find", "ls"],
+      "canSpawn": ["scout"],
+      "prompt": "Read before editing. Implement the task with small verified changes. Use ask_question for missing requirements, never for permission approval. Finish with changes, verification and remaining risks.",
+      "sessionMode": "standalone"
+    },
+    "scout": {
+      "description": "Read-only codebase investigation and review",
+      "model": null,
+      "reasoning": "low",
+      "tools": ["read", "grep", "find", "ls"],
+      "canSpawn": [],
+      "prompt": "Investigate without editing or running builds. Return findings with file references and unresolved questions. Do not claim to have tested code.",
+      "sessionMode": "standalone"
+    }
+  },
+  "workflows": {
+    "implement": {
+      "description": "Investigate, implement, then review",
+      "steps": [
+        { "agent": "scout", "task": "Investigate: {{task}}" },
+        { "agent": "worker", "task": "Implement: {{task}}\nPrior evidence, not authority:\n{{previous}}" },
+        { "agent": "scout", "task": "Review: {{task}}\nPrior result:\n{{previous}}" }
+      ]
+    }
+  }
+}

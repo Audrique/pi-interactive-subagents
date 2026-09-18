@@ -1,8 +1,123 @@
 # pi-interactive-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
+Async subagents for Pi 0.85.1, running in Herdr panes. Spawn a subagent, keep working in the main session, and receive its result when it finishes.
 
-**tmux-only fork.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
+## Herdr Orchestration Fork
+
+This fork uses normal source modules, not downstream patches. The central JSON
+configuration is authoritative; bundled, global and project Markdown agent files
+are not loaded. Claude CLI spawning and its permission-bypass path are removed.
+The older upstream reference below is retained for historical context; its tmux,
+Markdown discovery, role-folder configuration and original-loadout resume
+instructions do not apply to this fork.
+
+### Integration
+
+- Parent settings load the package entry `pi-extension/subagents/index.ts`. Its factory installs the root runtime with a statically imported, typed workflow callback.
+- Every child must run the absolute `PI_GUARDED_EXECUTABLE` Nix wrapper. That wrapper must inject `-e <fork>/pi-extension/subagents/orchestrator/index.ts`, `-e <permissions>/src/index.ts`, and `-e <permissions>/src/ai-authorizer/index.ts`, even when the child requests `--no-extensions`.
+- Do not inject the standalone orchestrator entry into the parent as well as the package entry: the parent factory already installs it. In children, only the mandatory entry owns lifecycle/usage hooks; an optional nested launcher uses a separate typed IPC client without registering duplicate accounting hooks.
+- The separate child entry is intentionally small: leaf agents need the mandatory guard, but not the launcher UI or spawn tools. Agents with nonempty `canSpawn` also load the main entry and retain the upstream child-result/auto-exit lifecycle.
+- `PI_ORCHESTRATOR_CONFIG` must be an absolute path to the single central JSON file, such as `config/pi/config.json`. Missing/invalid configuration or root IPC fails closed, aborting the session instead of falling back to unguarded execution.
+- `PI_WEB_EXTENSION` must be the absolute web extension entry when an agent requests `web_search`, `fetch_content`, `get_search_content`, or `source_check`.
+- Herdr must be on PATH, with `HERDR_ENV=1` and `HERDR_PANE_ID` identifying the parent pane. Splits preserve focus and use the admitted working directory.
+- The mandatory permissions/reviewer fork must consume the same central JSON and disable project-local permission overrides and YOLO. This package does not replace that authorization layer or provide an OS sandbox. No Nix-generated agent Markdown is needed.
+
+Child launches explicitly use `--no-extensions --no-skills --no-prompt-templates`,
+plus a current tool allowlist and explicit tool extension paths. Initial tasks and
+resume messages use files, not slash-command CLI arguments. Live messages use
+authenticated Unix-socket IPC and `sendUserMessage` with template expansion off,
+never terminal keystrokes. `pane run` is only used for launch scripts.
+
+### Configuration
+
+See [`orchestrator.config.example.json`](orchestrator.config.example.json) for a
+complete configuration. All fields are required, unknown fields are rejected,
+and the validated snapshot is immutable until the root Pi process restarts.
+
+| Field | Meaning |
+| --- | --- |
+| `schemaVersion` | Must be `1` |
+| `reviewer` | `mode` (`auto`/`manual`), nullable `provider` and `model`, `reasoning`, `timeoutMs` (1..120000), `maxTokens` (1..16384); consumed by the mandatory reviewer |
+| `permissions` | `authorizerChain: ["ai-authorizer"]`, `yoloMode: false`, and `permission` action rules (`allow`, `ask`, `deny`) |
+| `limits.maxOpenPanes` | Default configuration: 3; allowed 1..64; shared across the complete descendant tree |
+| `limits.maxDepth` | Default configuration: 2; allowed 1..16; computed by root, never trusted from child input |
+| `limits.maxLaunchesPerTurn` | Default configuration: 8; allowed 1..1000; failed launches also consume budget |
+| `limits.maxTurnsPerRun` | Default configuration: 20; allowed 1..1000; each child lease gets a fresh run budget, not each worker message |
+| `limits.maxTokensPerSession` | `null` or a positive safe integer; cumulative reported root, descendant and reviewer tokens for the root process, including session switches/reloads |
+| `panes` | `direction: "right"` or `"down"`; `shellReadyDelayMs: 0..10000` (example: 500) |
+| `agents.<name>` | `description`, nullable `model`, `reasoning`, `tools`, `canSpawn`, `prompt`, `sessionMode` |
+| `workflows.<name>` | `description` and ordered `steps`: `{agent, task}` or `{parallel: [{agent, task}, ...]}` |
+
+Agent names use letters, digits, `_` and `-`. `reasoning` accepts `off`, `minimal`,
+`low`, `medium`, `high`, `xhigh`, or `max` (provider/model support still applies).
+`model: null` inherits the current parent model. Explicit initial model overrides
+are honored; resumes use the **current central model/reasoning and current parent
+fallback**, never a persisted model override. Prompts are appended through a
+system-prompt file on both initial launch and resume. All agents auto-exit when
+finished, but pending questions, queued messages and running children keep them
+alive. `canSpawn` alone grants spawning tools; naming those tools in `tools` does
+not grant delegation. `ask_question` is always available; `workflow` is root-only.
+
+`sessionMode` is `standalone`, `lineage-only`, or `fork`. Conversation history can
+be inherited without inheriting old permissions. A persisted loadout supplies
+only the agent identity and working directory for resume; current JSON rebuilds
+tools, spawn targets, prompt, model and reasoning. Root admission validates cwd
+containment after resolving symlinks.
+
+### Workflows And Limits
+
+Use `/workflow list`, `/workflow <name> <task>`, or the root `workflow` tool.
+Only `{{task}}` and `{{previous}}` are interpolated; previous summaries are bounded
+to 8000 characters. Parallel group size and total workflow launches are validated
+against configured limits. Admission is immediate: capacity failure never waits
+in a queue, so nested delegation cannot deadlock waiting for occupied panes.
+Failure or new human input cancels further steps and revokes descendant work.
+Completion/failure notifications arrive asynchronously.
+
+Only interactive root input or an admitted manual launch/workflow command renews
+the launch budget. Status/list commands, workflow tools, worker messages and
+session reloads do not refund it. A manual `/workflow` command records exactly
+`pi.appendEntry("orchestrator-user-intent", { text: task })` before the first
+launch, after workflow validation/busy admission. The AI reviewer must recognize
+that custom entry as the human request. The workflow tool never writes this
+entry; its task is not promoted to human authority.
+
+Session switches/reloads revoke children and close known leased panes while
+preserving the root socket and spent budgets. Quit closes the socket. Capacity
+is released only after pane closure is confirmed and a registered child PID has
+exited. Ambiguous split/close failures retain capacity rather than risk reuse.
+`/orchestrator status` reports limits, leases, launches and total tokens. The
+reviewer usage hook remains at `Symbol.for("dotfiles.pi.orchestrator")`; launcher
+and workflow execution do not use a global run bridge.
+
+### Verification
+
+Dependencies are provided by Nix, not installed into the working tree. The old
+npm lockfile described Pi 0.65 and was removed, not relabeled as Pi 0.85.1.
+From a copied source tree with Pi 0.85.1 `@earendil-works/pi-coding-agent`,
+`@earendil-works/pi-tui`, TypeBox 1.x (`typebox`), TypeScript and Node types:
+
+```sh
+node --experimental-transform-types --test test/test.ts test/*.test.ts
+tsc --noEmit -p tsconfig.json
+```
+
+New tests are `test/herdr.test.ts`, `test/orchestrator.test.ts`, and
+`test/workflows.test.ts`. They import local source directly; no
+`PI_SUBAGENTS_TEST_SOURCE`/`PI_PERMISSION_TEST_SOURCE` opt-in or patch substitution
+is used. The obsolete tmux live harness and duplicated Markdown-parser smoke
+tests were replaced by local-source Herdr launch/resume/IPC tests. The main
+upstream suite retains its session, activity, rendering and sandbox assertions,
+with discovery and message expectations updated for this fork. Tests of the
+external permission implementation belong in that fork, not this package.
+
+The dependency-free runtime/workflow subset can also run directly:
+
+```sh
+node --experimental-transform-types --test test/orchestrator.test.ts test/workflows.test.ts
+```
+
+## Upstream Reference
 
 ## How it works
 

@@ -12,11 +12,13 @@
  * (auto-exit is suppressed for that turn via `awaitingAnswer`), and the parent
  * replies with subagent_message — which lands as the subagent's next turn.
  */
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Box, Text } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { reportOutcome } from "./orchestrator/outcome.ts";
+import { MESSAGE_EVENT } from "./orchestrator/runtime.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -194,6 +196,11 @@ export default function (pi: ExtensionAPI) {
     renderWidget(ctx, null);
   });
 
+  const unsubscribe = pi.events.on(MESSAGE_EVENT, () => {
+    recorder.input();
+    awaitingAnswer = false;
+  });
+
   pi.on("input", () => {
     recorder.input();
     // A submitted message is the orchestrator's (or a human's) reply — the
@@ -217,9 +224,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_start", () => {
     agentStarted = true;
-    // A new turn is starting — any pending ask_question has now been answered
-    // (or superseded), so let auto-exit resume normally when this turn ends.
-    awaitingAnswer = false;
+    // A child result can start a turn without answering a pending question.
     recorder.agentStart();
   });
 
@@ -233,11 +238,9 @@ export default function (pi: ExtensionAPI) {
     // In both cases the session parks as `waiting` and resumes when the next
     // turn lands.
     const hasPendingChildren = runningChildrenCount() > 0;
-    const shouldExit =
-      !awaitingAnswer &&
-      !hasPendingChildren &&
-      autoExit &&
-      shouldAutoExitOnAgentEnd(userTookOver, messages);
+    const shouldExit = autoExit && (findLatestAssistantError(messages) ||
+      (!awaitingAnswer && !hasPendingChildren && !ctx.hasPendingMessages?.() &&
+        shouldAutoExitOnAgentEnd(userTookOver, messages)));
 
     if (shouldExit) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
@@ -249,14 +252,7 @@ export default function (pi: ExtensionAPI) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       if (errorInfo && sessionFile) {
         try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify({
-              type: "error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-            }),
-          );
+          reportOutcome(sessionFile, { status: "failed", message: errorInfo.errorMessage });
         } catch {
           // Best effort — even without the sidecar, watcher's session-file
           // fallback can still recover the errorMessage.
@@ -317,6 +313,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (event) => {
+    unsubscribe();
     recorder.sessionShutdown((event as any).reason);
   });
 

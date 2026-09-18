@@ -4,8 +4,11 @@ import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { visibleWidth } from "@mariozechner/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import { fixture } from "./fixtures.ts";
+import { parseConfig } from "../pi-extension/subagents/orchestrator/config.ts";
+import { RuntimeClient } from "../pi-extension/subagents/orchestrator/runtime.ts";
 
 import {
   getLeafId,
@@ -30,7 +33,7 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/tmux.ts";
+import { shellEscape } from "../pi-extension/subagents/herdr.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -56,7 +59,7 @@ import {
   runningChildrenCount,
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/tmux.ts";
+import { __pollForExitTest__ } from "../pi-extension/subagents/herdr.ts";
 
 // --- Helpers ---
 
@@ -94,6 +97,7 @@ function createMockExtensionApi() {
     sentMessages,
     api: {
       on() {},
+      events: { on() { return () => {}; }, emit() {} },
       registerTool(tool: any) {
         registeredTools.push(tool);
       },
@@ -1067,8 +1071,12 @@ describe("status.ts", () => {
 
 describe("subagent discovery", () => {
   const testApi = (subagentsModule as any).__test__;
+  beforeEach(() => {
+    testApi.setCoordinator({ config: () => parseConfig(fixture()), client: new RuntimeClient(async () => {}), humanCommand() {} });
+  });
+  after(() => testApi.setCoordinator(undefined));
 
-  it("loads session-mode from frontmatter", async () => {
+  it("ignores project Markdown; loads central JSON session mode", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
         projectAgentsDir,
@@ -1080,13 +1088,14 @@ describe("subagent discovery", () => {
         ].join("\n"),
       );
 
-      const loaded = testApi.loadAgentDefaults("lineage-mode-test-agent");
-      assert.ok(loaded, "expected agent to load");
-      assert.equal(loaded.sessionMode, "lineage-only");
+      assert.equal(testApi.loadAgentDefaults("lineage-mode-test-agent"), null);
+      const config = fixture(); config.agents.worker.sessionMode = "lineage-only";
+      testApi.setCoordinator({ config: () => parseConfig(config) });
+      assert.equal(testApi.loadAgentDefaults("worker").sessionMode, "lineage-only");
     });
   });
 
-  it("loads explicit interactive flag from frontmatter", async () => {
+  it("project interactive flags cannot introduce agents", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
         projectAgentsDir,
@@ -1108,14 +1117,14 @@ describe("subagent discovery", () => {
       );
 
       const loadedTrue = testApi.loadAgentDefaults("interactive-true-test-agent");
-      assert.equal(loadedTrue?.interactive, true);
+      assert.equal(loadedTrue, null);
 
       const loadedFalse = testApi.loadAgentDefaults("interactive-false-test-agent");
-      assert.equal(loadedFalse?.interactive, false);
+      assert.equal(loadedFalse, null);
     });
   });
 
-  it("leaves interactive undefined when not set in frontmatter", async () => {
+  it("does not discover project agents without interactive flags either", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
         projectAgentsDir,
@@ -1127,7 +1136,7 @@ describe("subagent discovery", () => {
       );
 
       const loaded = testApi.loadAgentDefaults("interactive-unset-test-agent");
-      assert.equal(loaded?.interactive, undefined);
+      assert.equal(loaded, null);
     });
   });
 
@@ -1172,8 +1181,9 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled scout/researcher/worker all resolve as non-interactive (auto-exit)", () => {
-    for (const name of ["scout", "researcher", "worker"]) {
+  it("central agents resolve as autonomous, with no bundled fallback", () => {
+    assert.equal(testApi.loadAgentDefaults("researcher"), null);
+    for (const name of ["scout", "worker"]) {
       const defs = testApi.loadAgentDefaults(name);
       assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
       assert.equal(
@@ -1184,10 +1194,10 @@ describe("subagent discovery", () => {
     }
   });
 
-  it("worker is granted the spawning toolset restricted to scout and researcher", () => {
+  it("worker is granted exactly its JSON canSpawn targets", () => {
     const worker = testApi.loadAgentDefaults("worker");
     assert.ok(worker, "expected bundled worker to be discoverable");
-    assert.deepEqual(worker.subagentAgents, ["scout", "researcher"]);
+    assert.deepEqual(worker.subagentAgents, ["worker", "scout"]);
 
     const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true });
     assert.ok(allowlist, "expected an allowlist");
@@ -1195,27 +1205,31 @@ describe("subagent discovery", () => {
     for (const t of ["subagent", "subagent_message", "subagents_list"]) {
       assert.ok(tools.has(t), `expected spawning tool ${t} in worker allowlist`);
     }
-    assert.ok(tools.has("bash"), "expected worker to keep bash");
+    assert.ok(tools.has("read"), "expected worker to keep read");
+    assert.equal(tools.has("bash"), false);
   });
 
-  it("scout and researcher are not granted spawning tools", () => {
-    for (const name of ["scout", "researcher"]) {
+  it("leaf agents are not granted spawning tools", () => {
+    for (const name of ["scout"]) {
       const defs = testApi.loadAgentDefaults(name);
       assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
-      assert.equal(defs.subagentAgents, undefined, `${name} should not declare subagent_agents`);
+      assert.deepEqual(defs.subagentAgents, [], `${name} should not have canSpawn targets`);
     }
   });
 
   it("getToolExtensionPath maps custom tools and skips built-ins", () => {
     assert.equal(testApi.getToolExtensionPath("read"), undefined);
     assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
+    const previous = process.env.PI_WEB_EXTENSION;
+    process.env.PI_WEB_EXTENSION = fileURLToPath(import.meta.url);
+    assert.equal(testApi.getToolExtensionPath("web_search"), process.env.PI_WEB_EXTENSION);
+    restoreEnvVar("PI_WEB_EXTENSION", previous);
     assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
     // Spawning tools are registered by this extension itself.
     assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
   });
 
-  it("ignores invalid session-mode values", async () => {
+  it("ignores invalid project modes and rejects invalid central modes", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
         projectAgentsDir,
@@ -1228,8 +1242,9 @@ describe("subagent discovery", () => {
       );
 
       const loaded = testApi.loadAgentDefaults("invalid-mode-test-agent");
-      assert.ok(loaded, "expected agent to load");
-      assert.equal(loaded.sessionMode, undefined);
+      assert.equal(loaded, null);
+      const config = fixture(); (config.agents.worker as any).sessionMode = "sideways";
+      assert.throws(() => parseConfig(config), /session mode/);
     });
   });
 
@@ -1267,7 +1282,7 @@ describe("subagent discovery", () => {
         sessionMode: "fork",
         seededSessionMode: "fork",
         inheritsConversationContext: true,
-        taskDelivery: "direct",
+        taskDelivery: "artifact",
       },
     );
   });
@@ -1279,9 +1294,9 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
-    assert.equal(testApi.buildSubagentToolAllowlist(undefined), null);
-    assert.equal(testApi.buildSubagentToolAllowlist(""), null);
+  it("empty tools grant only the child control tool, never Pi defaults", () => {
+    assert.equal(testApi.buildSubagentToolAllowlist(undefined), "ask_question");
+    assert.equal(testApi.buildSubagentToolAllowlist(""), "ask_question");
   });
 
   it("applySandboxToParts replays model, identity, and default-deny tool restriction", () => {
@@ -1306,7 +1321,8 @@ describe("subagent discovery", () => {
       const joined = parts.join(" ");
       // Model with thinking suffix.
       assert.ok(joined.includes("--model"), "expected --model");
-      assert.ok(joined.includes("openrouter/z-ai/glm-5.2:medium"), "expected model:thinking");
+      assert.ok(joined.includes("openrouter/z-ai/glm-5.2"), "expected model");
+      assert.ok(joined.includes("--thinking 'medium'"), "expected explicit thinking even without model suffix");
       // Identity written to a file and appended.
       assert.ok(joined.includes("--append-system-prompt"), "expected --append-system-prompt");
       // Default-deny restriction.
@@ -1321,7 +1337,7 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("applySandboxToParts omits restriction flags when the loadout was unrestricted", () => {
+  it("applySandboxToParts always disables extension and prompt discovery", () => {
     withTempDir((d) => {
       const parts: string[] = [];
       testApi.applySandboxToParts(
@@ -1340,7 +1356,7 @@ describe("subagent discovery", () => {
         },
         { artifactDir: d, name: "fork" },
       );
-      assert.deepEqual(parts, []);
+      assert.deepEqual(parts, ["--no-extensions", "--no-skills", "--no-prompt-templates"]);
     });
   });
 
@@ -1365,7 +1381,7 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("lists visible agents from discovery", async () => {
+  it("lists central agents, never project definitions", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
         projectAgentsDir,
@@ -1379,6 +1395,7 @@ describe("subagent discovery", () => {
 
       const { api, registeredTools } = createMockExtensionApi();
       (subagentsModule as any).default(api);
+      testApi.setCoordinator({ config: () => parseConfig(fixture()) });
 
       const tool = registeredTools.find((tool) => tool.name === "subagents_list");
       assert.ok(tool, "expected subagents_list to be registered");
@@ -1386,12 +1403,12 @@ describe("subagent discovery", () => {
       const result = await tool.execute();
       const agents = result.details?.agents ?? [];
 
-      assert.ok(agents.some((agent: any) => agent.name === "visible-discovery-test-agent"));
-      assert.match(result.content[0].text, /visible-discovery-test-agent/);
+      assert.deepEqual(agents.map((agent: any) => agent.name).sort(), ["scout", "worker"]);
+      assert.doesNotMatch(result.content[0].text, /visible-discovery-test-agent/);
     });
   });
 
-  it("hides disable-model-invocation agents from listings but keeps direct loading", async () => {
+  it("hidden project agents cannot be loaded directly either", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
         projectAgentsDir,
@@ -1407,6 +1424,7 @@ describe("subagent discovery", () => {
 
       const { api, registeredTools } = createMockExtensionApi();
       (subagentsModule as any).default(api);
+      testApi.setCoordinator({ config: () => parseConfig(fixture()) });
 
       const tool = registeredTools.find((tool) => tool.name === "subagents_list");
       assert.ok(tool, "expected subagents_list to be registered");
@@ -1418,14 +1436,11 @@ describe("subagent discovery", () => {
       assert.doesNotMatch(result.content[0].text, /hidden-discovery-test-agent/);
 
       const loaded = testApi.loadAgentDefaults("hidden-discovery-test-agent");
-      assert.ok(loaded, "expected hidden agent to remain directly loadable");
-      assert.equal(loaded.model, "anthropic/test-hidden");
-      assert.equal(loaded.body, "You are the hidden agent.");
-      assert.equal(loaded.disableModelInvocation, true);
+      assert.equal(loaded, null);
     });
   });
 
-  it("lets a hidden project agent shadow a visible global agent", async () => {
+  it("neither global nor project Markdown can shadow the central JSON", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir, globalAgentsDir }) => {
       writeAgentFile(
         globalAgentsDir,
@@ -1451,6 +1466,7 @@ describe("subagent discovery", () => {
 
       const { api, registeredTools } = createMockExtensionApi();
       (subagentsModule as any).default(api);
+      testApi.setCoordinator({ config: () => parseConfig(fixture()) });
 
       const tool = registeredTools.find((tool) => tool.name === "subagents_list");
       assert.ok(tool, "expected subagents_list to be registered");
@@ -1462,10 +1478,7 @@ describe("subagent discovery", () => {
       assert.doesNotMatch(result.content[0].text, /shadowed-discovery-test-agent/);
 
       const loaded = testApi.loadAgentDefaults("shadowed-discovery-test-agent");
-      assert.ok(loaded, "expected project override to remain directly loadable");
-      assert.equal(loaded.model, "anthropic/test-project");
-      assert.equal(loaded.body, "You are the project hidden agent.");
-      assert.equal(loaded.disableModelInvocation, true);
+      assert.equal(loaded, null);
     });
   });
 });
@@ -1651,6 +1664,7 @@ describe("subagent-done.ts", () => {
       const handlers = new Map<string, Array<(...args: any[]) => void>>();
       const tools: any[] = [];
       const api = {
+        events: { on() { return () => {}; }, emit() {} },
         on(event: string, handler: (...args: any[]) => void) {
           if (!handlers.has(event)) handlers.set(event, []);
           handlers.get(event)!.push(handler);
@@ -1741,7 +1755,7 @@ describe("subagent-done.ts", () => {
   });
 });
 
-describe("tmux.ts interpretExitSidecar", () => {
+describe("herdr.ts interpretExitSidecar", () => {
   const { interpretExitSidecar } = __pollForExitTest__;
 
   it("no longer decodes ping payloads (ask_question keeps the session open instead)", () => {
@@ -1788,15 +1802,16 @@ describe("tmux.ts interpretExitSidecar", () => {
   });
 });
 describe("commands", () => {
-  it("/subagent emits a spawn tool call for a known agent", () => {
+  it("/subagent emits a spawn tool call for a known agent", async () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
 
     (subagentsModule as any).default(api);
 
     const subagent = registeredCommands.find((command) => command.name === "subagent");
     assert.ok(subagent, "expected /subagent to be registered");
+    subagentsModule.__test__.setCoordinator({ config: () => parseConfig(fixture()), humanCommand() {} } as any);
 
-    subagent.handler("scout map the auth code", {
+    await subagent.handler("scout map the auth code", {
       ui: { notify() {} },
     });
 
@@ -1827,6 +1842,7 @@ describe("tool registration", () => {
   it("rejects a top-level spawn with no agent and no fork", async () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
+    subagentsModule.__test__.setCoordinator({ config: () => parseConfig(fixture()) } as any);
     const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
     assert.ok(subagentTool, "expected subagent tool to be registered");
 
@@ -1838,6 +1854,7 @@ describe("tool registration", () => {
   it("rejects a top-level spawn naming an unknown agent", async () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
+    subagentsModule.__test__.setCoordinator({ config: () => parseConfig(fixture()) } as any);
     const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
     assert.ok(subagentTool, "expected subagent tool to be registered");
 
@@ -2214,34 +2231,33 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("steers a running subagent by typing into its pane (newlines flattened)", () => {
+  it("steers via IPC, preserving newlines as literal text", async () => {
     const testApi = (subagentsModule as any).__test__;
     let sentSurface = "";
     let sentText = "";
     const running = makeRunning();
 
-    const result = testApi.steerSubagent(running, "do this\nthen that", (surface: string, text: string) => {
-      sentSurface = surface;
-      sentText = text;
-    });
+    testApi.setCoordinator({ client: new RuntimeClient(async (_method, args) => {
+      sentSurface = args.sessionFile; sentText = args.text;
+    }) });
+    const result = await testApi.steerSubagent(running, "do this\nthen that");
 
     assert.deepEqual(result, { ok: true });
-    assert.equal(sentSurface, "pane-1");
-    assert.equal(sentText, "do this then that");
+    assert.equal(sentSurface, running.sessionFile);
+    assert.equal(sentText, "do this\nthen that");
   });
 
-  it("returns an explicit error when steering delivery fails", () => {
+  it("returns an explicit error when steering delivery fails", async () => {
     const testApi = (subagentsModule as any).__test__;
     const running = makeRunning();
 
-    const result = testApi.steerSubagent(running, "hi", () => {
-      throw new Error("mux write failed");
-    });
+    testApi.setCoordinator({ client: new RuntimeClient(async () => { throw new Error("IPC failed"); }) });
+    const result = await testApi.steerSubagent(running, "hi");
 
     assert.match(result.error, /Failed to deliver message/);
   });
 
-  it("delivers a steer message and forces local status waiting", () => {
+  it("delivers a steer message and forces local status waiting", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     let sentSurface = "";
@@ -2266,14 +2282,13 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning({ statusState: activeState }));
 
-      const result = withMockedNow(20_000, () =>
-        testApi.handleSubagentSteer({ name: "Worker", message: "keep going" }, (surface: string, text: string) => {
-          sentSurface = surface;
-          sentText = text;
-        }),
-      );
+      testApi.setCoordinator({ client: new RuntimeClient(async (_method, args) => {
+        sentSurface = args.sessionFile; sentText = args.text;
+      }) });
+      const result = await withMockedNow(20_000, () =>
+        testApi.handleSubagentSteer({ name: "Worker", message: "keep going" }));
 
-      assert.equal(sentSurface, "pane-1");
+      assert.equal(sentSurface, runningMap.get("a1").sessionFile);
       assert.equal(sentText, "keep going");
       assert.equal(result.content[0].text.includes('Message delivered to running subagent "Worker"'), true);
       assert.deepEqual(result.details, { id: "a1", name: "Worker", status: "steered" });
@@ -2285,20 +2300,20 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("requires a message when steering", () => {
+  it("requires a message when steering", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
     try {
       runningMap.set("a1", makeRunning());
-      const result = testApi.handleSubagentSteer({ name: "Worker", message: "  " }, () => {});
+      const result = await testApi.handleSubagentSteer({ name: "Worker", message: "  " });
       assert.match(result.content[0].text, /`message` is required/);
     } finally {
       runningMap.clear();
     }
   });
 
-  it("leaves status unchanged when steering delivery fails in the tool path", () => {
+  it("leaves status unchanged when steering delivery fails in the tool path", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
@@ -2321,11 +2336,9 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning({ statusState: activeState }));
 
-      const result = withMockedNow(20_000, () =>
-        testApi.handleSubagentSteer({ name: "Worker", message: "go" }, () => {
-          throw new Error("mux write failed");
-        }),
-      );
+      testApi.setCoordinator({ client: new RuntimeClient(async () => { throw new Error("IPC failed"); }) });
+      const result = await withMockedNow(20_000, () =>
+        testApi.handleSubagentSteer({ name: "Worker", message: "go" }));
 
       assert.match(result.content[0].text, /Failed to deliver message/);
       assert.equal(classifyStatus(runningMap.get("a1").statusState, 20_000).kind, "active");
@@ -2460,7 +2473,11 @@ describe("subagent status renderer", () => {
 });
 
 describe("subagent startup delay", () => {
-  it("defaults to 500ms when no env var is set", () => {
+  beforeEach(() => {
+    const config = fixture(); config.panes.shellReadyDelayMs = 500;
+    subagentsModule.__test__.setCoordinator({ config: () => parseConfig(config) } as any);
+  });
+  it("uses the central JSON value when no env override is set", () => {
     const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.getShellReadyDelayMs, "function");
@@ -2475,7 +2492,7 @@ describe("subagent startup delay", () => {
     }
   });
 
-  it("uses PI_SUBAGENT_SHELL_READY_DELAY_MS when it is set", () => {
+  it("ignores the legacy PI_SUBAGENT_SHELL_READY_DELAY_MS override", () => {
     const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.getShellReadyDelayMs, "function");
@@ -2483,7 +2500,7 @@ describe("subagent startup delay", () => {
     const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
     process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "2500";
     try {
-      assert.equal(testApi.getShellReadyDelayMs(), 2500);
+      assert.equal(testApi.getShellReadyDelayMs(), 500);
     } finally {
       if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
       else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
@@ -2652,7 +2669,7 @@ describe("subagent display helpers", () => {
   });
 });
 
-describe("tmux.ts", () => {
+describe("herdr.ts", () => {
   describe("shellEscape", () => {
     it("wraps in single quotes", () => {
       assert.equal(shellEscape("hello"), "'hello'");

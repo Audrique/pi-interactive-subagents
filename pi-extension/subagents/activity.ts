@@ -293,7 +293,7 @@ export function createSubagentActivityRecorder(params: {
   now?: () => number;
 }): SubagentActivityRecorder {
   const runningChildId = params.runningChildId?.trim();
-  const activityFile = params.activityFile?.trim();
+  const activityFile = params.activityFile?.trim() ?? "";
   if (!runningChildId || !activityFile) return createNoopRecorder();
 
   const now = params.now ?? (() => Date.now());

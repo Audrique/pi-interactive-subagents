@@ -81,17 +81,8 @@ export function seedSubagentSessionFile(params: {
 }
 
 /**
- * A snapshot of everything needed to reconstruct a subagent's sandbox when its
- * session is later resumed via `subagent_message({ sessionId })`.
- *
- * Written next to the session file as `<sessionFile>.loadout.json` at spawn
- * time. Resume replays this exact snapshot so the reincarnated process gets the
- * same `--no-extensions` + `--tools` restriction, model, identity, spawn
- * whitelist, cwd, and config dir it originally ran with — instead of falling
- * back to pi's default (all global extensions + full toolset). Storing the
- * resolved loadout (rather than re-deriving from the agent `.md` by name) keeps
- * resume faithful even if the agent definition is later edited, moved, or
- * deleted.
+ * Launch audit snapshot beside the session. Resume reads only agent identity
+ * and cwd, and rebuilds all privileges/model/prompt from current central JSON.
  */
 export interface SubagentLoadout {
   /** Agent profile name (for PI_SUBAGENT_AGENT); null for agentless spawns. */
@@ -100,7 +91,7 @@ export interface SubagentLoadout {
   toolAllowlist: string | null;
   /** Model id (without thinking suffix), or null to use the session default. */
   model: string | null;
-  /** Thinking level appended to the model as `model:level`, or null. */
+  /** Explicit --thinking level, independent of model selection. */
   thinking: string | null;
   /** How the identity text was applied: append/replace, or null. */
   systemPromptMode: "append" | "replace" | null;
@@ -123,12 +114,7 @@ export function loadoutSidecarPath(sessionFile: string): string {
 
 /** Persist a subagent's resolved sandbox loadout beside its session file. */
 export function writeSubagentLoadout(sessionFile: string, loadout: SubagentLoadout): void {
-  try {
-    writeFileSync(loadoutSidecarPath(sessionFile), JSON.stringify(loadout), "utf8");
-  } catch {
-    // Best-effort: a missing snapshot only means resume will refuse, never that
-    // it launches unrestricted.
-  }
+  writeFileSync(loadoutSidecarPath(sessionFile), JSON.stringify(loadout), "utf8");
 }
 
 /** Read a subagent's loadout snapshot, or null if absent/unparseable. */
@@ -190,18 +176,13 @@ export function registerName(
   name: string,
   entry: NameRegistryEntry,
 ): void {
-  try {
-    mkdirSync(artifactDir, { recursive: true });
-    const registry = readNameRegistry(artifactDir);
-    registry[name] = entry;
-    const p = nameRegistryPath(artifactDir);
-    const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
-    writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
-    renameSync(tmp, p);
-  } catch {
-    // Best-effort: a failed registration only means resume-by-name won't find
-    // this subagent later; it never breaks the spawn itself.
-  }
+  mkdirSync(artifactDir, { recursive: true });
+  const registry = readNameRegistry(artifactDir);
+  Object.defineProperty(registry, name, { value: entry, enumerable: true, configurable: true, writable: true });
+  const p = nameRegistryPath(artifactDir);
+  const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
+  writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
+  renameSync(tmp, p);
 }
 
 /** Resolve a name to its registry entry within a spawner session, or null. */
@@ -209,7 +190,8 @@ export function resolveNameInRegistry(
   artifactDir: string,
   name: string,
 ): NameRegistryEntry | null {
-  const entry = readNameRegistry(artifactDir)[name];
+  const registry = readNameRegistry(artifactDir);
+  const entry = Object.hasOwn(registry, name) ? registry[name] : undefined;
   return entry && typeof entry.sessionFile === "string" ? entry : null;
 }
 
