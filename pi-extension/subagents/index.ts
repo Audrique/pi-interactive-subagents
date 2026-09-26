@@ -25,6 +25,7 @@ import {
 import { childCoordinator, installOrchestrator, isChild, type Coordinator } from "./orchestrator/index.ts";
 import { describeOutcome, errorOutcome, isControlledStop, readOutcome, stopTitle, type Outcome } from "./orchestrator/outcome.ts";
 import { agentTools, ensure, text } from "./orchestrator/config.ts";
+import { installBackgroundActivity } from "./orchestrator/background-activity.ts";
 
 import {
   countSessionEntryLines,
@@ -1340,7 +1341,8 @@ export async function run(params: { agent: string; task: string; name?: string; 
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
-  coordinator = isChild() ? childCoordinator() : installOrchestrator(pi, run);
+  const activity = installBackgroundActivity(pi);
+  coordinator = isChild() ? childCoordinator() : installOrchestrator(pi, run, activity);
   latestPi = pi;
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
@@ -1401,6 +1403,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        return activity.track(async () => {
         // Central canSpawn is authoritative; root IPC enforces it again at admission.
         const permittedAgents = discoverAgentDefinitions().map((a) => a.name);
         const permittedSet = new Set(permittedAgents);
@@ -1505,15 +1508,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         startWidgetRefresh();
         startStatusRefresh(pi);
 
-        // Fire-and-forget: start watching in background
-        watchSubagent(running, watcherAbort.signal)
+        // Keep the hold through delivery, not just removal from runningSubagents.
+        void activity.track(() => watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             if (watcherAbort.signal.aborted) return;
             updateWidget(); // reflect removal from Map immediately
 
             const presentation = resolveResultPresentation(result, running.name);
 
-            pi.sendMessage(
+            return pi.sendMessage(
               {
                 customType: "subagent_result",
                 content: presentation,
@@ -1539,7 +1542,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .catch((err) => {
             if (watcherAbort.signal.aborted) return;
             updateWidget();
-            pi.sendMessage(
+            return pi.sendMessage(
               {
                 customType: "subagent_result",
                 content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
@@ -1548,7 +1551,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
-          });
+          })).catch(() => {}); // A replaced session may reject delivery.
 
         // Return immediately
         return {
@@ -1572,6 +1575,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             status: "started",
           },
         };
+        });
       },
 
       renderCall(args, theme) {
@@ -1756,6 +1760,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        return activity.track(async () => {
         const requestedName = params.name?.trim();
         if (!requestedName) {
           const err = "Provide the subagent's `name` to steer (if running) or resume (if finished).";
@@ -1843,11 +1848,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         startWidgetRefresh();
         startStatusRefresh(pi);
 
-        // Fire-and-forget watcher
+        // Fire-and-forget watcher, held through completion delivery.
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
-        watchSubagent(running, watcherAbort.signal)
+        void activity.track(() => watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             if (watcherAbort.signal.aborted) return;
             updateWidget();
@@ -1864,7 +1869,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               name,
             );
 
-            pi.sendMessage(
+            return pi.sendMessage(
               {
                 customType: "subagent_result",
                 content: presentation,
@@ -1887,7 +1892,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .catch((err) => {
             if (watcherAbort.signal.aborted) return;
             updateWidget();
-            pi.sendMessage(
+            return pi.sendMessage(
               {
                 customType: "subagent_result",
                 content: `Resume error: ${err?.message ?? String(err)}`,
@@ -1896,7 +1901,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
-          });
+          })).catch(() => {}); // A replaced session may reject delivery.
 
         return {
           content: [{ type: "text", text: `Session "${name}" resumed.` }],
@@ -1909,6 +1914,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             status: "started",
           },
         };
+        });
       },
     });
 

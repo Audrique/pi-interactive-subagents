@@ -37,15 +37,15 @@ export class WorkflowRunner {
   private active?: AbortController;
   cancel(reason: unknown = "workflow cancelled"): void { this.active?.abort(reason instanceof Error ? reason : new Error(String(reason))); }
   start(workflow: Workflow, task: string, run: (step: TaskStep, signal: AbortSignal) => ReturnType<Executor>,
-    complete: (text: string, outcome?: Outcome) => void, admitted: () => void = () => {}): void {
+    complete: (text: string, outcome?: Outcome) => void, admitted: () => void = () => {}): Promise<void> {
     ensure(!this.active, "workflow busy; wait for existing tasks to close");
     text(task);
     admitted();
     const controller = new AbortController(); this.active = controller;
-    void executeWorkflow(workflow, task, step => run(step, controller.signal), controller)
+    return executeWorkflow(workflow, task, step => run(step, controller.signal), controller)
       .then(summary => complete(`Workflow completed:\n${summary}`), error => {
         const outcome = errorOutcome(error);
-        complete(isControlledStop(outcome) ? `Workflow ${describeOutcome(outcome)}` : `Workflow failed: ${String(error)}`, outcome);
+        return complete(isControlledStop(outcome) ? `Workflow ${describeOutcome(outcome)}` : `Workflow failed: ${String(error)}`, outcome);
       })
       .catch(() => {}) // A replaced Pi session may reject completion delivery.
       .finally(() => { if (this.active === controller) this.active = undefined; });

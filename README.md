@@ -90,6 +90,31 @@ exited. Ambiguous split/close failures retain capacity rather than risk reuse.
 reviewer usage hook remains at `Symbol.for("dotfiles.pi.orchestrator")`; launcher
 and workflow execution do not use a global run bridge.
 
+### Background activity event contract
+
+The launcher publishes session-local `pi.events` snapshots on
+`pi-orchestrator:activity` with exactly `{ busy: boolean }`. Subscribe first, then
+emit `pi-orchestrator:activity-request` (no payload required): the producer answers
+synchronously, including `{ busy: false }` when there is no background work. It
+also publishes on `session_start` and busy/idle transitions. A consumer loaded
+before the producer receives the startup snapshot; one loaded later can request
+it. Consumers must treat missing/unknown snapshots as busy, never as idle.
+
+One shared producer holds busy across launch/resume (before their first await),
+watching, cleanup and completion-message queuing. Workflows hold busy across
+admission (including the manual-command intent callback), all steps and gaps,
+and terminal delivery. Overlapping children/workflows cannot clear each other's
+holds; cancelled children remain busy until their launch/watch cleanup settles.
+Returned delivery promises are included. This is independent of the running-pane
+map, parent `agent_settled`, and child auto-exit accounting.
+
+On `session_shutdown` the producer unsubscribes and resets silently; stale
+completions cannot publish or release new-session work. Consumers must also
+unsubscribe/reset to unknown on shutdown and subscribe/request again for the new
+session. This channel does not represent human UI or permission prompts; use Pi's
+`ui_prompt_start`/`ui_prompt_end` for those. Combine this background snapshot with
+Pi's own settled/pending-message state before reporting overall idle.
+
 ### Verification
 
 Dependencies are provided by Nix, not installed into the working tree. The old
@@ -111,11 +136,15 @@ upstream suite retains its session, activity, rendering and sandbox assertions,
 with discovery and message expectations updated for this fork. Tests of the
 external permission implementation belong in that fork, not this package.
 
-The dependency-free runtime/workflow subset can also run directly:
+The dependency-free activity/workflow subset can also run directly:
 
 ```sh
-node --experimental-transform-types --test test/orchestrator.test.ts test/workflows.test.ts
+node --experimental-transform-types --test test/background-activity.test.ts test/workflows.test.ts
 ```
+
+`test/background-integration.test.ts` additionally tests the installed launcher,
+resume and workflow paths, including the window after watcher map deletion but
+before completion delivery and the manual workflow admission callback.
 
 ## Upstream Reference
 

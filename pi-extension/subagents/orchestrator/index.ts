@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { agentTools, ensure, loadConfig, parseConfig, type Config, type TaskStep } from "./config.ts";
 import { connectRuntime, KEY, MESSAGE_EVENT, RootRuntime, RuntimeClient } from "./runtime.ts";
 import { WorkflowRunner } from "./workflow.ts";
+import { installBackgroundActivity, type BackgroundActivity } from "./background-activity.ts";
 import { closeLeasedSurface } from "../herdr.ts";
 
 // Reload persistence only, never the launcher/reviewer communication channel.
@@ -33,8 +34,10 @@ export function childCoordinator(): Coordinator {
     humanCommand: () => { throw new Error("Orchestrator: human commands are root-only"); } };
 }
 
-export function installOrchestrator(pi: ExtensionAPI, run?: Runner): Coordinator {
+export function installOrchestrator(pi: ExtensionAPI, run?: Runner, activity?: BackgroundActivity): Coordinator {
   const child = isChild();
+  // The root launcher passes its producer; the mandatory child guard owns none.
+  activity ??= child ? undefined : installBackgroundActivity(pi);
   let runtime: RuntimeClient | undefined, root: RootRuntime | undefined, config: Config | undefined;
   let context: ExtensionContext | undefined, timer: ReturnType<typeof setTimeout> | undefined;
   let problem = "runtime not initialized", active = true, ready = false, generation = 0;
@@ -168,16 +171,19 @@ export function installOrchestrator(pi: ExtensionAPI, run?: Runner): Coordinator
     ensure(run, "interactive subagent runner unavailable");
     const current = generation;
     let reported = false;
-    workflows.start(config.workflows[name], task,
-      (step, signal) => root!.scope.run(signal, () => {
+    // Acquire before start(): its admitted callback runs before active is set.
+    const finish = activity!.begin();
+    try {
+      void workflows.start(config.workflows[name], task,
+      (step, signal) => activity!.track(() => root!.scope.run(signal, () => {
         root!.check(); signal.throwIfAborted(); return run(step, ctx, signal);
-      }),
+      })),
       (content, outcome) => {
         // Stopping disables execution, not the current workflow's terminal
         // report. Shutdown/session replacement still invalidates this closure.
         if (reported || current !== generation || (!active && !(outcome && terminalGeneration === current))) return;
         reported = true;
-        pi.sendMessage({ customType: "orchestrator-workflow", content, details: { outcome }, display: true },
+        return pi.sendMessage({ customType: "orchestrator-workflow", content, details: { outcome }, display: true },
           { triggerTurn: false, deliverAs: "followUp" });
       },
       () => {
@@ -186,7 +192,8 @@ export function installOrchestrator(pi: ExtensionAPI, run?: Runner): Coordinator
           pi.appendEntry("orchestrator-user-intent", { text: task });
           coordinator.humanCommand();
         }
-      });
+      }).finally(finish);
+    } catch (error) { finish(); throw error; }
   };
   pi.registerMessageRenderer("orchestrator-workflow", (message, _options, theme) => {
     const outcome = (message.details as any)?.outcome;
