@@ -1,6 +1,6 @@
 # pi-interactive-subagents
 
-Async subagents for Pi 0.85.1, running in Herdr panes. Spawn a subagent, keep working in the main session, and receive its result when it finishes.
+Async subagents for Pi 1.0.x, running in Herdr panes. Spawn a subagent, keep working in the main session, and receive its result when it finishes.
 
 ## Herdr Orchestration Fork
 
@@ -117,10 +117,19 @@ Pi's own settled/pending-message state before reporting overall idle.
 
 ### Verification
 
-Dependencies are provided by Nix, not installed into the working tree. The old
-npm lockfile described Pi 0.65 and was removed, not relabeled as Pi 0.85.1.
-From a copied source tree with Pi 0.85.1 `@earendil-works/pi-coding-agent`,
-`@earendil-works/pi-tui`, TypeBox 1.x (`typebox`), TypeScript and Node types:
+Dependencies are provided by the `pi-runtime` Nix flake, not installed into the
+working tree. Its `pi` input owns the exact CLI and SDK version; this fork's Pi
+peer dependencies declare compatibility, not a second SDK installation.
+
+From your `pi-runtime` checkout, check local fork changes without changing pins:
+
+```sh
+nix build .#checks.x86_64-linux.subagents --no-link --no-write-lock-file \
+  --override-input pi-interactive-subagents path:/home/audrique/pi-forks/pi-interactive-subagents
+```
+
+The Nix check copies the source, supplies Pi 1.0.x libraries, TypeBox 1.x
+(`typebox`), TypeScript and Node types, then runs:
 
 ```sh
 node --experimental-transform-types --test test/test.ts test/*.test.ts
