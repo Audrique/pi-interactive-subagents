@@ -35,7 +35,8 @@ test("first cause survives consumed sidecar and late generic assistant abort; er
   Object.assign(process.env, { PI_SUBAGENT_AUTO_EXIT: "1", PI_SUBAGENT_SESSION: session });
   delete process.env.PI_SUBAGENT_ACTIVITY_FILE;
   reportOutcome(session, stop);
-  const result = await pollForExit("unused", new AbortController().signal, { interval: 1, sessionFile: session });
+  const completion = { file: join(dir, "completion.json"), runId: "stopped-run" };
+  const result = await pollForExit("unused", new AbortController().signal, { interval: 1, completion, sessionFile: session });
   assert.equal(result.reason, "stopped"); assert.equal(result.exitCode, 1);
   rmSync(`${session}.exit`, { force: true }); // Consumer removes the transient notification.
   const mock = mockPi(); subagentDone(mock.pi as any);
@@ -46,10 +47,10 @@ test("first cause survives consumed sidecar and late generic assistant abort; er
   reportOutcome(failed, { status: "failed", message: "provider overloaded" });
   reportOutcome(failed, stop);
   assert.equal(readOutcome(failed)?.status, "failed");
-  assert.equal((await pollForExit("unused", new AbortController().signal, { interval: 1, sessionFile: failed })).reason, "error");
+  assert.equal((await pollForExit("unused", new AbortController().signal, { interval: 1, completion, sessionFile: failed })).reason, "error");
   assert.deepEqual(__pollForExitTest__.interpretExitSidecar({ type: "error", errorMessage: "This operation was aborted" }),
     { reason: "error", exitCode: 1, errorMessage: "This operation was aborted" });
-  assert.deepEqual(__pollForExitTest__.interpretExitSidecar({ type: "done" }), { reason: "done", exitCode: 0 });
+  assert.equal(__pollForExitTest__.interpretExitSidecar({ type: "done" }), undefined);
 });
 
 test("turn limit crosses IPC, persists descendants before closure, and leaves siblings available", async t => {
@@ -144,7 +145,7 @@ for (const outcome of [stop, quotaFailure]) {
       root.dispatch(null, "launched", { id: lease.id, paneId: surface, sessionFile });
       reportOutcome(sessionFile, outcome);
       const running = { id: lease.id, name: surface, task: "task", surface, sessionFile, startTime: Date.now(),
-        interactive: false, statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+        completion: { file: join(dir, "completion.json"), runId: lease.id }, interactive: false, statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
         releaseLease: async () => {
           for (const method of ["paneClosed", "release"]) {
             events.push(method);

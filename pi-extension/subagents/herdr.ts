@@ -73,6 +73,37 @@ export function sendLongCommand(surface: string, command: string, options?: { sc
   writeFileSync(scriptPath, `#!/bin/bash\n${preamble}\n${command}\n`, { mode: 0o700 });
   sendCommand(surface, `bash ${shellEscape(scriptPath)}`); return scriptPath;
 }
+export interface CompletionSignal { file: string; runId: string }
+
+/** Publish only after the foreground command exits; rename keeps readers from seeing partial JSON. */
+export function commandWithCompletion(command: string, completion: CompletionSignal): string {
+  const temporary = `${completion.file}.tmp`;
+  const prefix = JSON.stringify({ version: 1, runId: completion.runId }).slice(0, -1);
+  return [
+    `if ${command}; then`,
+    "  pi_subagent_exit_code=0",
+    "else",
+    "  pi_subagent_exit_code=$?",
+    "fi",
+    "(",
+    "  umask 077",
+    `  printf '%s,"exitCode":%d}\\n' ${shellEscape(prefix)} "$pi_subagent_exit_code" > ${shellEscape(temporary)} &&`,
+    `    mv -f -- ${shellEscape(temporary)} ${shellEscape(completion.file)}`,
+    ")",
+    'exit "$pi_subagent_exit_code"',
+  ].join("\n");
+}
+
+function readCompletion(completion: CompletionSignal): PollResult | undefined {
+  try {
+    const data = JSON.parse(readFileSync(completion.file, "utf8"));
+    if (data?.version === 1 && data.runId === completion.runId &&
+      Number.isInteger(data.exitCode) && data.exitCode >= 0 && data.exitCode <= 255) {
+      return { reason: "done", exitCode: data.exitCode };
+    }
+  } catch { /* Absent or invalid completion records do not terminate a run. */ }
+}
+
 function readArgs(surface: string, lines: number): string[] {
   return ["pane", "read", surface, "--source", "recent-unwrapped", "--lines", String(Math.max(1, Math.floor(lines)))];
 }
@@ -101,8 +132,8 @@ export function closeLeasedSurface(surface: string): void {
   }
   owned.delete(surface); closed.add(surface);
 }
-export interface PollResult { reason: "done" | "sentinel" | "error" | "stopped"; exitCode: number; errorMessage?: string; outcome?: Outcome }
-function interpretExitSidecar(data: any): PollResult {
+export interface PollResult { reason: "done" | "error" | "stopped"; exitCode: number; errorMessage?: string; outcome?: Outcome }
+function interpretExitSidecar(data: any): PollResult | undefined {
   if (isControlledStop(data?.outcome)) return { reason: "stopped", exitCode: 1, outcome: data.outcome };
   if (data?.type === "stopped") return { reason: "error", exitCode: 1, errorMessage: "Invalid controlled-stop metadata in sidecar." };
   if (data?.type === "error") {
@@ -110,7 +141,8 @@ function interpretExitSidecar(data: any): PollResult {
       ? data.errorMessage : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
     return { reason: "error", exitCode: 1, errorMessage };
   }
-  return { reason: "done", exitCode: 0 };
+  // Success requires the current run's completion record, not an uncorrelated legacy sidecar.
+  return undefined;
 }
 export const __pollForExitTest__ = { interpretExitSidecar };
 function exitSidecar(sessionFile?: string): PollResult | undefined {
@@ -126,19 +158,18 @@ function exitSidecar(sessionFile?: string): PollResult | undefined {
   } catch { /* Retry a partially written sidecar next tick. */ }
 }
 export async function pollForExit(surface: string, signal: AbortSignal,
-  options: { interval: number; sessionFile?: string; sentinelFile?: string; onTick?: (elapsed: number) => void },
+  options: { interval: number; completion: CompletionSignal; sessionFile?: string; onTick?: (elapsed: number) => void },
 ): Promise<PollResult> {
   const start = Date.now();
   for (;;) {
     signal.throwIfAborted();
-    const sidecar = exitSidecar(options.sessionFile);
-    if (sidecar) return sidecar;
-    if (options.sentinelFile && existsSync(options.sentinelFile)) return { reason: "sentinel", exitCode: 0 };
+    const terminal = exitSidecar(options.sessionFile) ?? readCompletion(options.completion);
+    if (terminal) return terminal;
     try {
-      const match = (await readScreenAsync(surface, 5)).match(/__SUBAGENT_DONE_(\d+)__/);
-      if (match) return { reason: "sentinel", exitCode: Number(match[1]) };
+      // Read only to detect a closed/disconnected pane, never to infer process completion.
+      await readScreenAsync(surface, 1);
     } catch (error) {
-      return exitSidecar(options.sessionFile) ?? { reason: "error", exitCode: 1,
+      return exitSidecar(options.sessionFile) ?? readCompletion(options.completion) ?? { reason: "error", exitCode: 1,
         errorMessage: `Cannot read Herdr pane ${surface}; it may have closed or the server disconnected. ${String(error)}` };
     }
     options.onTick?.(Math.floor((Date.now() - start) / 1000));

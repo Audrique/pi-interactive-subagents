@@ -18,9 +18,11 @@ import {
   muxSetupHint,
   createSurface,
   sendLongCommand,
+  commandWithCompletion,
   pollForExit,
   closeSurface,
   shellEscape,
+  type CompletionSignal,
 } from "./herdr.ts";
 import { childCoordinator, installOrchestrator, isChild, type Coordinator } from "./orchestrator/index.ts";
 import { describeOutcome, errorOutcome, isControlledStop, readOutcome, stopTitle, type Outcome } from "./orchestrator/outcome.ts";
@@ -520,7 +522,7 @@ interface RunningSubagent {
   };
   abortController?: AbortController;
   cli?: string;
-  sentinelFile?: string;
+  completion: CompletionSignal;
   statusState: SubagentStatusState;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
@@ -1104,6 +1106,9 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = options?.sessionFile ?? join(sessionDir, `${timestamp}_${uuid}.jsonl`);
   const lease = await runtime.reserve({ agent: params.agent, name: params.name!, cwd: targetCwdForSession, resume: !!options?.sessionFile });
+  const completion: CompletionSignal = {
+    file: join(artifactDir, "subagent-completions", `${lease.id}.json`), runId: lease.id,
+  };
   let surface: string | undefined;
   let splitAttempted = false;
   try {
@@ -1158,14 +1163,17 @@ async function launchSubagent(
     mkdirSync(dirname(artifactPath), { recursive: true });
     writeFileSync(artifactPath, fullTask, "utf8");
     parts.push(shellEscape(`@${artifactPath}`));
-    const command = `cd ${shellEscape(targetCwdForSession)} && ${envPrefix} ${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    mkdirSync(dirname(completion.file), { recursive: true, mode: 0o700 });
+    const command = commandWithCompletion(
+      `cd ${shellEscape(targetCwdForSession)} && ${envPrefix} ${parts.join(" ")}`, completion,
+    );
     const launchScriptFile = join(artifactDir, "subagent-scripts", `${id}.sh`);
     sendLongCommand(surface, command, { scriptPath: launchScriptFile,
       scriptPreamble: `Subagent: ${params.name}\nSession: ${subagentSessionFile}\nSurface: ${surface}` });
 
     const running: RunningSubagent = {
       id, name: params.name, task: params.task, agent: params.agent, surface, startTime,
-      sessionFile: subagentSessionFile, launchScriptFile, activityFile, interactive: effectiveInteractive,
+      sessionFile: subagentSessionFile, launchScriptFile, activityFile, completion, interactive: effectiveInteractive,
       statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
       releaseLease: async () => { await runtime.paneClosed(lease.id); await runtime.release(lease.id); },
     };
@@ -1248,7 +1256,7 @@ async function collectSubagentResult(
     const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
       interval: 1000,
       sessionFile,
-      sentinelFile: running.sentinelFile,
+      completion: running.completion,
       onTick() {
         observeRunningSubagent(running);
         deliverPendingQuestion(running);

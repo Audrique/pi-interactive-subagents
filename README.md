@@ -28,6 +28,15 @@ resume messages use files, not slash-command CLI arguments. Live messages use
 authenticated Unix-socket IPC and `sendUserMessage` with template expansion off,
 never terminal keystrokes. `pane run` is only used for launch scripts.
 
+Completion is independent of terminal output and pane width. After Pi exits, its
+launch script atomically publishes `{version: 1, runId, exitCode}` under the
+parent session's `artifacts/<session-id>/subagent-completions/<lease-id>.json`.
+Each launch/resume has a fresh lease and completion file; the watcher validates
+the run identity and exit code before closing the pane and queuing the result.
+Existing failure/controlled-stop outcomes take precedence. Terminal reads detect
+pane disconnection only; printed completion markers are not trusted. Results
+queued during a parent tool call are consumed at the next turn boundary.
+
 ### Configuration
 
 See [`orchestrator.config.example.json`](orchestrator.config.example.json) for a

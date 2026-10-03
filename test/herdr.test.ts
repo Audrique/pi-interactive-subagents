@@ -40,16 +40,18 @@ test("Herdr contract: explicit no-focus splits, owned launch, literal scripts an
   readReply = "unwrapped screen";
   assert.equal(herdr.readScreen("w1:p2", 12), "unwrapped screen");
   assert.deepEqual(calls.at(-1), ["pane", "read", "w1:p2", "--source", "recent-unwrapped", "--lines", "12"]);
-  readReply = "__SUBAGENT_DONE_7__";
-  assert.deepEqual(await herdr.pollForExit("w1:p2", new AbortController().signal, { interval: 1 }), { reason: "sentinel", exitCode: 7 });
+  const completion = { file: join(dir, "completion.json"), runId: "contract-run" };
+  writeFileSync(completion.file, JSON.stringify({ version: 1, runId: completion.runId, exitCode: 7 }));
+  assert.deepEqual(await herdr.pollForExit("w1:p2", new AbortController().signal, { interval: 1, completion }), { reason: "done", exitCode: 7 });
+  rmSync(completion.file);
   readError = Object.assign(new Error("Command failed"), { stderr: JSON.stringify({ error: { code: "not_found", message: "pane not found" } }) });
-  assert.match((await herdr.pollForExit("w1:p2", new AbortController().signal, { interval: 1 })).errorMessage!, /not_found/);
+  assert.match((await herdr.pollForExit("w1:p2", new AbortController().signal, { interval: 1, completion })).errorMessage!, /not_found/);
   const sessionFile = join(dir, "session.jsonl");
   writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "error", errorMessage: "provider overloaded" }));
-  assert.deepEqual(await herdr.pollForExit("w1:p2", new AbortController().signal, { interval: 1, sessionFile }),
+  assert.deepEqual(await herdr.pollForExit("w1:p2", new AbortController().signal, { interval: 1, completion, sessionFile }),
     { reason: "error", exitCode: 1, errorMessage: "provider overloaded" });
   const controller = new AbortController(); readReply = ""; readError = null;
-  await assert.rejects(herdr.pollForExit("w1:p2", controller.signal, { interval: 1, onTick: () => controller.abort() }), /abort/i);
+  await assert.rejects(herdr.pollForExit("w1:p2", controller.signal, { interval: 1, completion, onTick: () => controller.abort() }), /abort/i);
   reply = null; assert.throws(() => herdr.closeSurface("w1:p2"), /no result/);
   reply = { type: "ok" }; herdr.closeSurface("w1:p2");
   const count = calls.length; herdr.closeSurface("w1:p2"); assert.equal(calls.length, count);
@@ -98,18 +100,24 @@ test("local source launch, workflow, resume and IPC messages use current JSON", 
   } };
   t.after(() => mock.emit("session_shutdown", { reason: "quit" }, ctx).then(() => {}));
   let pane = 10, deny = false, failClose = false, failSplit = false, failRun = false, failLaunched = false;
-  let reserveGate: Promise<void> | undefined, script = "", resumed = false;
+  let reserveGate: Promise<void> | undefined, script = "", resumed = false, leaseNumber = 0;
   const events: string[] = [], messages: string[] = [];
+  const completions: herdr.CompletionSignal[] = [];
   const runtime = new RuntimeClient(async (method, args) => {
     events.push(method);
     if (method === "reserve") {
       if (deny) throw new Error("limit reached"); resumed = args.resume; await reserveGate;
-      return { id: "lease", env: { PI_TEST_ROOT: "root-session" } };
+      return { id: `lease-${++leaseNumber}`, env: { PI_TEST_ROOT: "root-session" } };
     }
     if (method === "launched") {
       if (failLaunched) throw new Error("registration failed");
       writeFileSync(args.sessionFile, [JSON.stringify({ type: "session", id: "child" }),
         JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "Finished task" }] } })].join("\n"));
+      const completionDir = join(dir, "artifacts/parent/subagent-completions");
+      mkdirSync(completionDir, { recursive: true });
+      const completion = { file: join(completionDir, `${args.id}.json`), runId: args.id };
+      completions.push(completion);
+      writeFileSync(completion.file, JSON.stringify({ version: 1, runId: completion.runId, exitCode: 0 }));
     }
     if (method === "message") messages.push(args.text);
   });
@@ -127,9 +135,7 @@ test("local source launch, workflow, resume and IPC messages use current JSON", 
     }
     return JSON.stringify({ result: { pane: { pane_id: `launch:p${++pane}` } } });
   });
-  t.mock.method(childProcess, "execFile", (_file: string, _args: string[], _options: unknown, cb: Function) => {
-    cb(null, "__SUBAGENT_DONE_0__");
-  });
+  t.mock.method(childProcess, "execFile", () => assert.fail("completed runs must not depend on terminal reads"));
   const params = { agent: "worker", task: "/fork\nordinary task", name: "job" };
   mod.__test__.setCoordinator(undefined);
   await assert.rejects(mod.run(params, ctx), /requires.*orchestrator/);
@@ -144,6 +150,7 @@ test("local source launch, workflow, resume and IPC messages use current JSON", 
   assert.match(script, /--no-extensions/); assert.match(script, /--model 'test\/parent-model' --thinking 'high'/);
   assert.match(script, /PI_TEST_ROOT='root-session'/); assert.equal(script.includes("/fork"), false);
   assert.match(script, /PI_SUBAGENT_ALLOWED='worker,scout'/);
+  assert.doesNotMatch(script, /__SUBAGENT_DONE_/);
   await assert.rejects(mod.run(params, ctx), /already in use/);
   let unblock!: () => void; reserveGate = new Promise<void>(resolve => { unblock = resolve; });
   const concurrent = mod.run({ ...params, name: "parallel" }, ctx);
@@ -167,6 +174,8 @@ test("local source launch, workflow, resume and IPC messages use current JSON", 
   unblock(); await resuming; reserveGate = undefined;
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(resumed, true); assert.match(script, /--model 'test\/current' --thinking 'low'/);
+  assert.notEqual(completions[0].file, completions.at(-1)!.file);
+  assert.notEqual(completions[0].runId, completions.at(-1)!.runId);
   assert.match(script, /--tools 'read,ask_question'/); assert.match(script, /PI_SUBAGENT_ALLOWED=''/);
   assert.equal(script.includes("STALE"), false); assert.equal(script.includes("/quit"), false);
   const promptPath = script.match(/--append-system-prompt '([^']+)'/)![1];

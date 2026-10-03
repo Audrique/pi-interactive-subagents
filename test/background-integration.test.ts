@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import childProcess from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -36,15 +36,20 @@ test("launch and resume stay busy before reserve resolves and after map deletion
     __test__.setCoordinator(undefined); __test__.runningSubagents.clear();
     process.env = env; rmSync(dir, { recursive: true, force: true });
   });
-  let reserve!: () => void, deliver!: () => void, deny = false, failDelivery = false;
+  let reserve!: () => void, deliver!: () => void, deny = false, failDelivery = false, leaseNumber = 0;
   const runtime = new RuntimeClient(async (method, args) => {
     if (method === "reserve") {
       assert.equal(state.snapshot(), true);
       if (deny) throw new Error("launch denied");
       await new Promise<void>(resolve => { reserve = resolve; });
-      return { id: "lease", env: {} };
+      return { id: `lease-${++leaseNumber}`, env: {} };
     }
-    if (method === "launched") writeFileSync(args.sessionFile, JSON.stringify({ type: "session", id: "child" }) + "\n");
+    if (method === "launched") {
+      writeFileSync(args.sessionFile, JSON.stringify({ type: "session", id: "child" }) + "\n");
+      const completionDir = join(dir, "artifacts/parent/subagent-completions");
+      mkdirSync(completionDir, { recursive: true });
+      writeFileSync(join(completionDir, `${args.id}.json`), JSON.stringify({ version: 1, runId: args.id, exitCode: 0 }));
+    }
   });
   __test__.setCoordinator({ client: runtime, config: fixture, humanCommand() {} });
   let pane = 0;
@@ -53,7 +58,7 @@ test("launch and resume stay busy before reserve resolves and after map deletion
     if (args[1] === "run") return "";
     return JSON.stringify({ result: { pane: { pane_id: `activity:${++pane}` } } });
   });
-  t.mock.method(childProcess, "execFile", (_file: string, _args: string[], _options: unknown, cb: Function) => cb(null, "__SUBAGENT_DONE_0__"));
+  t.mock.method(childProcess, "execFile", () => assert.fail("completed runs must not depend on terminal reads"));
   t.mock.method(mock.pi, "sendMessage", async () => {
     assert.equal(__test__.runningSubagents.size, 0, "watch already removed the child");
     assert.equal(state.snapshot(), true, "delivery still owns a hold");

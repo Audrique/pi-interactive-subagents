@@ -1758,20 +1758,12 @@ describe("subagent-done.ts", () => {
 describe("herdr.ts interpretExitSidecar", () => {
   const { interpretExitSidecar } = __pollForExitTest__;
 
-  it("no longer decodes ping payloads (ask_question keeps the session open instead)", () => {
-    // ask_question writes a `.ask` signal, not a `.exit` ping sidecar, so an
-    // unknown `type: "ping"` payload now falls through to a clean done.
-    assert.deepEqual(
-      interpretExitSidecar({ type: "ping", name: "Worker", message: "need help" }),
-      { reason: "done", exitCode: 0 },
-    );
+  it("ignores obsolete question pings (ask_question keeps the session open instead)", () => {
+    assert.equal(interpretExitSidecar({ type: "ping", name: "Worker", message: "need help" }), undefined);
   });
 
-  it("decodes done payloads", () => {
-    assert.deepEqual(interpretExitSidecar({ type: "done" }), {
-      reason: "done",
-      exitCode: 0,
-    });
+  it("does not treat an uncorrelated legacy done payload as process completion", () => {
+    assert.equal(interpretExitSidecar({ type: "done" }), undefined);
   });
 
   it("decodes error payloads and propagates the message with a non-zero exit code", () => {
@@ -1791,14 +1783,15 @@ describe("herdr.ts interpretExitSidecar", () => {
 
   it("falls back to a placeholder when error payload has no errorMessage", () => {
     const result = interpretExitSidecar({ type: "error" });
+    assert.ok(result);
     assert.equal(result.reason, "error");
     assert.equal(result.exitCode, 1);
     assert.match(result.errorMessage ?? "", /no errorMessage/);
   });
 
-  it("treats unknown payload shapes as done", () => {
-    assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
-    assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
+  it("ignores unknown payload shapes", () => {
+    assert.equal(interpretExitSidecar({}), undefined);
+    assert.equal(interpretExitSidecar(null), undefined);
   });
 });
 describe("commands", () => {
